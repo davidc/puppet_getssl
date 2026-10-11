@@ -259,6 +259,18 @@
 # 2021-02-15 ADD ftp explicit SSL with curl for upload the challenge (CoolMischa)
 # 2021-02-18 Add FULL_CHAIN_INCLUDE_ROOT
 # 2021-03-25 Fix DNS challenge completion check if CNAMEs on different NS are used (sideeffect42)(2.35)
+# 2021-05-08 Merge from tlhackque/getssl: GoDaddy, split-view, tempfile permissions fixes, --version(2.36)
+# 2021-07-07 Request new certificate if SANs have changed (#669)(#673)
+# 2021-07-12 Do not redirect outputs on remote commands when the debug option is used (atisne)
+# 2021-07-20 Use +noidnout to enable certificates for IDN domains (#679)(2.37)
+# 2021-07-22 Only pass +noidnout param to dig/drill(#682)(2.38)
+# 2021-07-25 Fix copy_file_to_location failures with ssh when suffix applied to file lacking an extension (tlhackque)(#686)
+# 2021-07-27 Support ftps://, FTPS_OPTIONS, remove default --insecure parameter to ftpes. Report caller(s) of error_exit in debug and test modes (tlhackque)(#687)(2.39)
+# 2021-07-30 Prefer API V2 when both offered (tlhackque) (#690) (2.40)
+# 2021-07-30 Run tests with -d to catch intermittent failures, Use fork's repo for upgrade tests. (tlhackque) (#692) (2.41)
+# 2021-08-26 Improve upgrade check & make upgrade do a full install when possible (tlhackque) (#694) (2.42)
+# 2021-09-02 Fix version compare - cURL v8 may have single digit minor numbers. (tlhackque) (2.43)
+# 2021-09-26 Delete key file when key algorithm has changed (makuhama)
 # ----------------------------------------------------------------------------------------
 
 case :$SHELLOPTS: in
@@ -267,17 +279,23 @@ esac
 
 PROGNAME=${0##*/}
 PROGDIR="$(cd "$(dirname "$0")" || exit; pwd -P;)"
-VERSION="2.35"
+VERSION="2.43"
 
 # defaults
 ACCOUNT_KEY_LENGTH=4096
 ACCOUNT_KEY_TYPE="rsa"
-CA="https://acme-staging-v02.api.letsencrypt.org/directory"
 CA_CERT_LOCATION=""
+CA="https://acme-staging-v02.api.letsencrypt.org/directory"
 CHALLENGE_CHECK_TYPE="http"
-CHECK_REMOTE="true"
 CHECK_REMOTE_WAIT=0
-CODE_LOCATION="https://raw.githubusercontent.com/srvrco/getssl/master/getssl"
+CHECK_REMOTE="true"
+if [[ -n "${GITHUB_REPOSITORY}" ]] ; then
+  CODE_LOCATION="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/getssl/master/getssl"
+  RELEASE_API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+else
+  CODE_LOCATION="https://raw.githubusercontent.com/srvrco/getssl/master/getssl"
+  RELEASE_API="https://api.github.com/repos/srvrco/getssl/releases/latest"
+fi
 CSR_SUBJECT="/"
 CURL_USERAGENT="${PROGNAME}/${VERSION}"
 DEACTIVATE_AUTH="false"
@@ -285,10 +303,12 @@ DEFAULT_REVOKE_CA="https://acme-v02.api.letsencrypt.org"
 DOMAIN_KEY_LENGTH=4096
 DUAL_RSA_ECDSA="false"
 FTP_OPTIONS=""
+FTPS_OPTIONS=""
 FULL_CHAIN_INCLUDE_ROOT="false"
 GETSSL_IGNORE_CP_PRESERVE="false"
 HTTP_TOKEN_CHECK_WAIT=0
 IGNORE_DIRECTORY_DOMAIN="false"
+OCSP_MUST_STAPLE="false"
 ORIG_UMASK=$(umask)
 PREFERRED_CHAIN=""              # Set this to use an alternative root certificate
 PREVIOUSLY_VALIDATED="true"
@@ -299,16 +319,15 @@ REUSE_PRIVATE_KEY="true"
 SERVER_TYPE="https"
 SKIP_HTTP_TOKEN_CHECK="false"
 SSLCONF="$(openssl version -d 2>/dev/null| cut -d\" -f2)/openssl.cnf"
-OCSP_MUST_STAPLE="false"
-TEMP_UPGRADE_FILE=""
 TOKEN_USER_ID=""
 USE_SINGLE_ACL="false"
 WORKING_DIR_CANDIDATES=("/etc/getssl" "${PROGDIR}/conf" "${PROGDIR}/.getssl" "${HOME}/.getssl")
 
 # Variables used when validating using a DNS entry
 VALIDATE_VIA_DNS=""             # Set this to "true" to enable DNS validation
-AUTH_DNS_SERVER=""              # Use this DNS server to check the challenge token has been set
-PUBLIC_DNS_SERVER=""            # Use this DNS server to find the authoritative DNS servers for the domain
+export AUTH_DNS_SERVER=""       # Use this DNS server to check the challenge token has been set
+export DNS_CHECK_OPTIONS=""     # Options (such as TSIG file) required by DNS_CHECK_FUNC
+export PUBLIC_DNS_SERVER=""     # Use this DNS server to find the authoritative DNS servers for the domain
 CHECK_ALL_AUTH_DNS="false"      # Check the challenge token has been set on all authoritative DNS servers
 CHECK_PUBLIC_DNS_SERVER="true"  # Check the public DNS server as well as the authoritative DNS servers
 DNS_ADD_COMMAND=""              # Use this command/script to add the challenge token to the DNS entries for the domain
@@ -321,22 +340,24 @@ DNS_WAIT_RETRY_ADD="false"      # Try the dns_add_command again if the DNS recor
 # Private variables
 _CHECK_ALL=0
 _CREATE_CONFIG=0
+_CURL_VERSION=""
 _FORCE_RENEW=0
-_KEEP_VERSIONS=""
 _MUTE=0
 _NOTIFY_VALID=0
+_NOMETER=""
 _QUIET=0
 _RECREATE_CSR=0
+_REDIRECT_OUTPUT="1>/dev/null 2>&1"
 _REVOKE=0
-_RUNNING_TEST=0
 _TEST_SKIP_CNAME_CALL=0
 _TEST_SKIP_SOA_CALL=0
 _UPGRADE=0
 _UPGRADE_CHECK=1
+_UPGRADE_TO_TAG=""
 _USE_DEBUG=0
 _ONLY_CHECK_CONFIG=0
 config_errors="false"
-LANG=C
+export LANG=C
 API=1
 
 # store copy of original command in case of upgrading script and re-running
@@ -527,6 +548,17 @@ check_challenge_completion_dns() { # perform validation via DNS challenge
   # check for token at public dns server, waiting for a valid response.
   for ns in $primary_ns; do
     info "checking DNS at $ns"
+
+    # add +noidnout if idn-domain so search for domain in results works
+    if [[ "${d}" == xn--* || "${d}" == *".xn--"* ]]; then
+      if [[ "$DNS_CHECK_FUNC" == "nslookup" || "$DNS_CHECK_FUNC" == "host" || ("$DNS_CHECK_FUNC" == "dig" && "$DIG_SUPPORTS_NOIDNOUT" == "false") ]]; then
+        info "Info: idn domain but $DNS_CHECK_FUNC doesn't support +noidnout"
+      else
+        debug "adding +noidnout to DNS_CHECK_OPTIONS"
+        DNS_CHECK_OPTIONS="$DNS_CHECK_OPTIONS +noidnout"
+      fi
+    fi
+
     ntries=0
     check_dns="fail"
     while [[ "$check_dns" == "fail" ]]; do
@@ -535,17 +567,21 @@ check_challenge_completion_dns() { # perform validation via DNS challenge
                       | grep ^_acme -A2\
                       | grep '"'|awk -F'"' '{ print $2}')
       elif [[ "$DNS_CHECK_FUNC" == "drill" ]] || [[ "$DNS_CHECK_FUNC" == "dig" ]]; then
-        debug "$DNS_CHECK_FUNC" TXT "${rr}" "@${ns}"
-        check_result=$($DNS_CHECK_FUNC TXT "${rr}" "@${ns}" \
+        # shellcheck disable=SC2086
+        debug "$DNS_CHECK_FUNC" $DNS_CHECK_OPTIONS TXT "${rr}" "@${ns}"
+        # shellcheck disable=SC2086
+        check_result=$($DNS_CHECK_FUNC $DNS_CHECK_OPTIONS TXT "${rr}" "@${ns}" \
                       | grep -i "^${rr}" \
                       | grep 'IN\WTXT'|awk -F'"' '{ print $2}')
-        debug "check_result=$check_result"
+        debug "check_result=\"$check_result\""
         if [[ -z "$check_result" ]]; then
-          debug "$DNS_CHECK_FUNC" ANY "${rr}" "@${ns}"
-          check_result=$($DNS_CHECK_FUNC ANY "${rr}" "@${ns}" \
+          # shellcheck disable=SC2086
+          debug "$DNS_CHECK_FUNC" $DNS_CHECK_OPTIONS ANY "${rr}" "@${ns}"
+          # shellcheck disable=SC2086
+          check_result=$($DNS_CHECK_FUNC $DNS_CHECK_OPTIONS ANY "${rr}" "@${ns}" \
                       | grep -i "^${rr}" \
                       | grep 'IN\WTXT'|awk -F'"' '{ print $2}')
-          debug "check_result=$check_result"
+          debug "check_result=\"$check_result\""
         fi
       elif [[ "$DNS_CHECK_FUNC" == "host" ]]; then
         check_result=$($DNS_CHECK_FUNC -t TXT "${rr}" "${ns}" \
@@ -558,8 +594,8 @@ check_challenge_completion_dns() { # perform validation via DNS challenge
                       | grep 'text ='|awk -F'"' '{ print $2}')
         fi
       fi
-      debug "expecting  $auth_key"
-      debug "${ns} gave ... $check_result"
+      debug "expecting  \"$auth_key\""
+      debug "${ns} gave ... \"$check_result\""
 
       if [[ "$check_result" == *"$auth_key"* ]]; then
         check_dns="success"
@@ -568,9 +604,9 @@ check_challenge_completion_dns() { # perform validation via DNS challenge
           ntries=$(( ntries + 1 ))
 
           if [[ $DNS_WAIT_RETRY_ADD == "true" && $(( ntries % 10 )) == 0 ]]; then
-            test_output "Deleting DNS RR via command: ${DNS_DEL_COMMAND}"
+            debug "Deleting DNS via command: ${DNS_DEL_COMMAND}"
             del_dns_rr "${d}" "${auth_key}"
-            test_output "Retrying adding DNS via command: ${DNS_ADD_COMMAND}"
+            debug "Retrying adding DNS via command: ${DNS_ADD_COMMAND}"
             add_dns_rr "${d}" "${auth_key}" \
               || error_exit "DNS_ADD_COMMAND failed for domain ${d}"
           fi
@@ -581,7 +617,7 @@ check_challenge_completion_dns() { # perform validation via DNS challenge
           debug "dns check failed - removing existing value"
           del_dns_rr "${d}" "${auth_key}"
 
-          error_exit "checking ${rr} gave $check_result not $auth_key"
+          error_exit "checking \"${rr}\" gave \"$check_result\" not \"$auth_key\""
         fi
       fi
     done
@@ -613,7 +649,7 @@ check_config() { # check the config files for all obvious errors
     rsa|prime256v1|secp384r1|secp521r1)
       debug "checked PRIVATE_KEY_ALG " ;;
     *)
-      info "${DOMAIN}: invalid PRIVATE_KEY_ALG - $PRIVATE_KEY_ALG"
+      info "${DOMAIN}: invalid PRIVATE_KEY_ALG - '$PRIVATE_KEY_ALG'"
       config_errors=true ;;
   esac
   if [[ "$DUAL_RSA_ECDSA" == "true" ]] && [[ "$PRIVATE_KEY_ALG" == "rsa" ]]; then
@@ -647,6 +683,7 @@ check_config() { # check the config files for all obvious errors
   tmplist=$(mktemp 2>/dev/null || mktemp -t getssl.XXXXXX) || error_exit "mktemp failed"
   for d in "${alldomains[@]}"; do # loop over domains (dn is domain number)
     debug "checking domain $d"
+
     if [[ "$(grep "^${d}$" "$tmplist")" = "$d" ]]; then
       info "${DOMAIN}: $d appears to be duplicated in domain, SAN list"
       config_errors=true
@@ -669,32 +706,42 @@ check_config() { # check the config files for all obvious errors
         config_errors=true
       fi
 
-      # check domain exists using all DNS utilities
+      # check domain exists using all DNS utilities. DNS_CHECK_OPTIONS may bind IP address or provide TSIG
+
       found_ip=false
       if [[ -n "$HAS_DIG_OR_DRILL" ]]; then
-        debug "DNS lookup using $HAS_DIG_OR_DRILL ${d}"
-        if [[ "$($HAS_DIG_OR_DRILL -t SOA "${d}" |grep -c -i "^${d}")" -ge 1 ]]; then
+        # add +noidnout if idn-domain so search for domain in results works
+        DIG_CHECK_OPTIONS="$DNS_CHECK_OPTIONS"
+        if [[ ("${d}" == xn--* || "${d}" == *".xn--"* ) && "$DIG_SUPPORTS_NOIDNOUT" == "true" ]]; then
+          DIG_CHECK_OPTIONS="$DNS_CHECK_OPTIONS +noidnout"
+        fi
+
+        debug "DNS lookup using $HAS_DIG_OR_DRILL $DIG_CHECK_OPTIONS ${d}"
+        # shellcheck disable=SC2086
+        if [[ "$($HAS_DIG_OR_DRILL $DIG_CHECK_OPTIONS -t SOA "${d}" |grep -c -i "^${d}")" -ge 1 ]]; then
           found_ip=true
-        elif [[ "$($HAS_DIG_OR_DRILL -t A "${d}"|grep -c -i "^${d}")" -ge 1 ]]; then
+        elif [[ "$($HAS_DIG_OR_DRILL $DIG_CHECK_OPTIONS -t A "${d}"|grep -c -i "^${d}")" -ge 1 ]]; then
           found_ip=true
-        elif [[ "$($HAS_DIG_OR_DRILL -t AAAA "${d}"|grep -c -i "^${d}")" -ge 1 ]]; then
+        elif [[ "$($HAS_DIG_OR_DRILL $DIG_CHECK_OPTIONS -t AAAA "${d}"|grep -c -i "^${d}")" -ge 1 ]]; then
           found_ip=true
         fi
       fi
 
       if [[ "$HAS_HOST" == "true" ]]; then
-        debug "DNS lookup using host ${d}"
-        if [[ "$(host "${d}" |grep -c -i "^${d}")" -ge 1 ]]; then
+        debug "DNS lookup using host $DNS_CHECK_OPTIONS ${d}"
+        # shellcheck disable=SC2086
+        if [[ "$(host $DNS_CHECK_OPTIONS "${d}" |grep -c -i "^${d}")" -ge 1 ]]; then
           found_ip=true
         fi
       fi
 
       if [[ "$HAS_NSLOOKUP" == "true" ]]; then
-        debug "DNS lookup using nslookup -query AAAA ${d}"
-        if [[ "$(nslookup -query=AAAA "${d}"|grep -c -i "^${d}.*has AAAA address")" -ge 1 ]]; then
+        debug "DNS lookup using nslookup $DNS_CHECK_OPTIONS -query AAAA ${d}"
+        # shellcheck disable=SC2086
+        if [[ "$(nslookup $DNS_CHECK_OPTIONS -query=AAAA "${d}"|grep -c -i "^${d}.*has AAAA address")" -ge 1 ]]; then
           debug "found IPv6 record for ${d}"
           found_ip=true
-        elif [[ "$(nslookup "${d}"| grep -c ^Name)" -ge 1 ]]; then
+        elif [[ "$(nslookup $DNS_CHECK_OPTIONS "${d}"| grep -c ^Name)" -ge 1 ]]; then
           debug "found IPv4 record for ${d}"
           found_ip=true
         fi
@@ -717,71 +764,137 @@ check_config() { # check the config files for all obvious errors
   debug "${DOMAIN}: check_config completed  - all OK"
 }
 
-check_getssl_upgrade() { # check if a more recent version of code is available available
-  TEMP_UPGRADE_FILE="$(mktemp 2>/dev/null || mktemp -t getssl.XXXXXX)"
-  if [ "$TEMP_UPGRADE_FILE" == "" ]; then
-    error_exit "mktemp failed"
+check_getssl_upgrade() { # check if a more recent release is available
+  # Check GitHub for latest stable release, or a specified tag
+  if [[ -n "$_UPGRADE_TO_TAG" ]]; then
+      RELEASE_API="$RELEASE_API/tags/$_UPGRADE_TO_TAG"
   fi
-  curl --user-agent "$CURL_USERAGENT" --silent "$CODE_LOCATION" --output "$TEMP_UPGRADE_FILE"
+  local release_data release_tag release_ver local_ver release_desc NEWCMD
+  debug "Checking for releases at $RELEASE_API"
+  # Sometimes the json is pretty-printed, sometimes not.  Loosely tied to --user-agent, but not
+  # always.  Normalize it enough to get the 3 elements necessary. Oh, for jq...
+  # shellcheck disable=SC2086
+  release_data="$(curl ${_NOMETER:---silent} --user-agent "$CURL_USERAGENT" -H 'Accept: application/vnd.github.v3+json' "$RELEASE_API" | sed -e's/\("[^:]*": *\("[^""]*",\|[^,]*[,}]\)\)/\r\n\1/g')"
   errcode=$?
   if [[ $errcode -eq 60 ]]; then
     error_exit "curl needs updating, your version does not support SNI (multiple SSL domains on a single IP)"
   elif [[ $errcode -gt 0 ]]; then
-    error_exit "curl error : $errcode"
+    error_exit "curl error checking releases: $errcode"
   fi
-  latestversion=$(awk -F '"' '$1 == "VERSION=" {print $2}' "$TEMP_UPGRADE_FILE")
-  latestvdec=$(echo "$latestversion"| tr -d '.')
-  localvdec=$(echo "$VERSION"| tr -d '.' )
+  # Replace error in release description with _error (which is ignored by check_output_for_errors() in the tests)
+  debug "${release_data//error/_error}"
+  release_data="$(sed -e's/^ *//g' <<<"${release_data}")"
+  release_tag="$(sed -e'/^"tag_name": *"/!d;s/^"tag_name": *"\([^""]*\).*$/\1/' <<<"${release_data}")"
+  if [[ "${release_tag:0:1}" != 'v' ]] ; then
+    if [[ ${_MUTE} -eq 0 ]]; then
+      info "The current repository has no releases or is improperly tagged; can't check for upgrades: '$release_tag'"
+    fi
+    return 0
+  fi
+  release_ver="$( tr -d '.v' <<<"${release_tag}")"
+  local_ver="$( tr -d '.' <<<"${VERSION}")"
   debug "current code is version ${VERSION}"
-  debug "Most recent version is  ${latestversion}"
-  # use a default of 0 for cases where the latest code has not been obtained.
-  if [[ "${latestvdec:-0}" -gt "$localvdec" ]]; then
-    if [[ ${_UPGRADE} -eq 1 ]]; then
-      if ! install "$0" "${0}.v${VERSION}"; then
-        error_exit "problem renaming old version while updating, check permissions"
-      fi
-      if ! install -m 700 "$TEMP_UPGRADE_FILE" "$0"; then
-        error_exit "problem installing new version while updating, check permissions"
-      fi
-      if [[ ${_MUTE} -eq 0 ]]; then
-        echo "Updated getssl from v${VERSION} to v${latestversion}"
-        echo "These update notifications can be turned off using the -Q option"
-        echo ""
-        echo "Updates are;"
-        awk "/\(${VERSION}\)$/ {s=1} s; /\(${latestversion}\)$/ || /^# ----/ {s=0}" "$TEMP_UPGRADE_FILE" | awk '{if(NR>1)print}'
-        echo ""
-      fi
-      if [[ -n "$_KEEP_VERSIONS" ]] && [[ "$_KEEP_VERSIONS" =~ ^[0-9]+$ ]]; then
-        # Obtain all locally stored old versions in getssl_versions
-        declare -a getssl_versions
-        shopt -s nullglob
-        for getssl_version in "$0".v*; do
-          getssl_versions[${#getssl_versions[@]}]="$getssl_version"
-        done
-        shopt -u nullglob
-        # Explicitly sort the getssl_versions array to make sure
-        shopt -s -o noglob
-        # shellcheck disable=SC2207
-        IFS=$'\n' getssl_versions=($(sort <<< "${getssl_versions[*]}"))
-        shopt -u -o noglob
-        # Remove entries until given number of old versions to keep is reached
-        while [[ ${#getssl_versions[@]} -gt $_KEEP_VERSIONS ]]; do
-          debug "removing old version ${getssl_versions[0]}"
-          rm "${getssl_versions[0]}"
-          getssl_versions=("${getssl_versions[@]:1}")
-        done
-      fi
-      if ! eval "$ORIGCMD"; then
-        error_exit "Running upgraded getssl failed"
-      fi
-      graceful_exit
-    else
+  debug "Most recent version is  ${release_tag:1}"
+  if [[ -z "$_UPGRADE_TO_TAG" ]] ; then
+    if [[ "$local_ver" -ge "$release_ver" ]] ; then return 0; fi
+  else
+    if [[ "$local_ver" -eq "$release_ver" ]] ; then return 0; fi
+  fi
+  if [[ ${_UPGRADE} -ne 1 ]]; then
+    if [[ ${_MUTE} -eq 0 ]]; then
+      release_desc="$(sed -e'/^"body": *"/!d;s/^"body": *"\([^""]*\).*$/\1/;s/\\r/\r/g;s/\\n/\n/g' <<<"$release_data")"
       info ""
-      info "A more recent version (v${latestversion}) of getssl is available, please update"
+      info "A more recent version (${release_tag}) than $VERSION of getssl is available, please update"
       info "The easiest way is to use the -u or --upgrade flag"
       info ""
+      info "Release ${release_tag} summary"
+      # Replace error in release description with _error (which is ignored by check_output_for_errors() in the tests)
+      info "${release_desc//error/_error}"
+      info ""
     fi
+    return 0;
   fi
+
+  # Download the latest tag
+  TEMP_UPGRADE_FILE="$(mktemp 2>/dev/null || mktemp -t getssl.XXXXXX)"
+  if [ "$TEMP_UPGRADE_FILE" == "" ]; then
+    error_exit "mktemp failed"
+  fi
+  CODE_LOCATION=$(sed -e"s/getssl\/master/${release_tag}/" <<<"$CODE_LOCATION")
+  # shellcheck disable=SC2086
+  debug curl ${_NOMETER:---silent} --user-agent "$CURL_USERAGENT" "$CODE_LOCATION" --output "$TEMP_UPGRADE_FILE"
+  # shellcheck disable=SC2086
+  curl ${_NOMETER:---silent} --user-agent "$CURL_USERAGENT" "$CODE_LOCATION" --output "$TEMP_UPGRADE_FILE"
+  errcode=$?
+
+  if [[ $errcode -eq 60 ]]; then
+    error_exit "curl needs updating, your version does not support SNI (multiple SSL domains on a single IP)"
+  elif [[ $errcode -gt 0 ]]; then
+    error_exit "curl error downloading release: $errcode"
+  fi
+
+  if ! install "$0" "${0}.v${VERSION}"; then
+    error_exit "problem renaming old version while updating, check permissions"
+  fi
+  if ! install -m 700 "$TEMP_UPGRADE_FILE" "$0"; then
+    error_exit "problem installing new version while updating, check permissions"
+  fi
+
+  if [[ ${_MUTE} -eq 0 ]]; then
+    echo "Updated getssl from v${VERSION} to ${release_tag}"
+    echo "The old version remains as ${0}.v${VERSION} and should be removed"
+    echo "These update notifications can be turned off using the -Q option"
+    echo ""
+    echo "Updates are:"
+    awk "/\(${VERSION}\)$/ {s=1} s; /\(${release_tag}\)$/ || /^# ----/ {s=0}" "$TEMP_UPGRADE_FILE" | awk '{if(NR>1)print}'
+    echo ""
+  fi
+
+  # Delete old versions, but not the version just upgraded (which can't be removed since disappearing can confuse bash)
+  declare -a getssl_versions
+  shopt -s nullglob
+  for getssl_version in "$0".v*; do
+    if [[ "$getssl_version" != "${0}.v${VERSION}" ]] ; then
+      getssl_versions[${#getssl_versions[@]}]="$getssl_version"
+    fi
+  done
+  shopt -u nullglob
+  if [[ -n "${getssl_versions[*]}" ]] ; then
+    rm "${getssl_versions[@]}"
+  fi
+
+  # Inhibit check for upgrades when running the new version
+  NEWCMD="$(sed -e's/ -\(u\|-upgrade\|U\|-nocheck\)//g;s/^\([^ ]* \)/\1--nocheck /' <<<"$ORIGCMD")"
+  clean_up
+  if [[ ${_MUTE} -eq 0 ]]; then
+    info "Installed $release_tag, restarting with $NEWCMD"
+  fi
+  if ! eval "$NEWCMD"; then
+    error_exit "Running upgraded getssl failed"
+  fi
+
+  graceful_exit
+}
+
+check_version() { # true if version string $1 >= $2
+  local v1 v2 i n1 n2 n
+  # $1 and $2 can be different lengths, but all parts must be numeric
+  if [[ "$1" == "$2" ]] ; then return 0; fi
+  local IFS='.'
+  # shellcheck disable=SC2206
+  v1=($1)
+  # shellcheck disable=SC2206
+  v2=($2)
+  n1="${#v1[@]}"
+  n2="${#v2[@]}"
+  if [[ "$n1" -ge "$n2" ]] ; then n="$n1" ; else n="$n2" ; fi
+  for ((i=0; i<n; i++)) do
+    n1="${v1[$i]:-0}"
+    n2="${v2[$i]:-0}"
+    if [[ $((10#$n1)) -gt $((10#$n2)) ]] ; then return 0 ; fi
+    if [[ $((10#$n1)) -lt $((10#$n2)) ]] ; then return 1 ; fi
+  done
+  return 0
 }
 
 clean_up() { # Perform pre-exit housekeeping
@@ -804,9 +917,6 @@ clean_up() { # Perform pre-exit housekeeping
         rm -rf "${TEMP_DIR:?}"
     fi
   fi
-  if [[ -n "$TEMP_UPGRADE_FILE" ]] && [[ -f "$TEMP_UPGRADE_FILE" ]]; then
-    rm -f "$TEMP_UPGRADE_FILE"
-  fi
 }
 
 copy_file_to_location() { # copies a file, using scp, sftp or ftp if required.
@@ -817,7 +927,12 @@ copy_file_to_location() { # copies a file, using scp, sftp or ftp if required.
   IFS=\; read -r -a copy_locations <<<"$3"
   for to in "${copy_locations[@]}"; do
     if [[ -n "$suffix" ]]; then
-      to="${to%.*}.${suffix}.${to##*.}"
+      bname="$(basename "$to")"
+      if [[ "${bname##*.}" == "$bname" ]]; then
+        to="${to}.${suffix}"
+      else
+        to="${to%.*}.${suffix}.${to##*.}"
+      fi
     fi
     info "copying $cert to $to"
     if [[ "${to:0:4}" == "ssh:" ]] ; then
@@ -862,8 +977,8 @@ copy_file_to_location() { # copies a file, using scp, sftp or ftp if required.
       fi
       $FTP_COMMAND <<- _EOF
 			open $ftphost
-      user $ftpuser $ftppass
-      $FTP_OPTIONS
+			user $ftpuser $ftppass
+			$FTP_OPTIONS
 			cd $ftpdirn
 			lcd $fromdir
 			put ./$fromfile
@@ -900,8 +1015,9 @@ copy_file_to_location() { # copies a file, using scp, sftp or ftp if required.
       fromfile=$(basename "$from")
       debug "davs user=$davsuser - pass=$davspass - host=$davshost port=$davsport dir=$davsdirn file=$davsfile"
       debug "from dir=$fromdir  file=$fromfile"
-      curl -u "${davsuser}:${davspass}" -T "${fromdir}/${fromfile}" "https://${davshost}:${davsport}${davsdirn}${davsfile}"
-    elif [[ "${to:0:6}" == "ftpes:" ]] ; then
+      # shellcheck disable=SC2086
+      curl ${_NOMETER} -u "${davsuser}:${davspass}" -T "${fromdir}/${fromfile}" "https://${davshost}:${davsport}${davsdirn}${davsfile}"
+    elif [[ "${to:0:6}" == "ftpes:" ]] || [[ "${to:0:5}" == "ftps:" ]] ; then
       debug "using ftp to copy the file from $from"
       ftpuser=$(echo "$to"| awk -F: '{print $2}')
       ftppass=$(echo "$to"| awk -F: '{print $3}')
@@ -913,7 +1029,13 @@ copy_file_to_location() { # copies a file, using scp, sftp or ftp if required.
       fromfile=$(basename "$from")
       debug "ftp user=$ftpuser - pass=$ftppass - host=$ftphost dir=$ftpdirn file=$ftpfile"
       debug "from dir=$fromdir  file=$fromfile"
-      curl --insecure --ftp-ssl -u "${ftpuser}:${ftppass}" -T "${fromdir}/${fromfile}" "ftp://${ftphost}${ftpdirn}/"
+      if [[ "${to:0:5}" == "ftps:" ]] ; then
+        # shellcheck disable=SC2086
+        curl ${_NOMETER} $FTPS_OPTIONS --ftp-ssl --ftp-ssl-reqd -u "${ftpuser}:${ftppass}" -T "${fromdir}/${fromfile}" "ftp://${ftphost}${ftpdirn}:990/"
+      else
+        # shellcheck disable=SC2086
+        curl ${_NOMETER} $FTPS_OPTIONS --ftp-ssl --ftp-ssl-reqd -u "${ftpuser}:${ftppass}" -T "${fromdir}/${fromfile}" "ftp://${ftphost}${ftpdirn}/"
+      fi
     else
       if ! mkdir -p "$(dirname "$to")" ; then
         error_exit "cannot create ACL directory $(basename "$to")"
@@ -962,7 +1084,7 @@ create_csr() { # create a csr using a given key (if it doesn't already exist)
       info "existing csr at $csr_file does not have the same domains as the config - re-create-csr"
       _RECREATE_CSR=1
     else
-      test_output "Existing csr at $csr_file contains same domains as the config"
+      debug "Existing csr at $csr_file contains same domains as the config"
     fi
   fi
   # end of ... check if domain csr exists - if not then create it
@@ -1095,9 +1217,9 @@ date_renew() { # calculates the renewal time in epoch
 
 debug() { # write out debug info if the debug flag has been set
   if [[ ${_USE_DEBUG} -eq 1 ]]; then
-    # If running tests then output in TAP format (for debugging tests)
-    if [[ ${_RUNNING_TEST} -eq 1 ]]; then
-      echo "# $(date "+%b %d %T") ${FUNCNAME[1]}:${BASH_LINENO[1]}" "$@" >&3
+    # If running tests then verbose output (for debugging tests)
+    if [[ -n ${BATS_RUN_TMPDIR} ]]; then
+      echo "$(date "+%b %d %T") ${FUNCNAME[1]}:${BASH_LINENO[1]}" "$@"
     else
       echo " "
       echo "$@"
@@ -1105,14 +1227,11 @@ debug() { # write out debug info if the debug flag has been set
   fi
 }
 
-test_output() { # write out debug output for testing
-  if [[ ${_RUNNING_TEST} -eq 1 ]]; then
-    echo "#" "$@"
-  fi
-}
-
 error_exit() { # give error message on error exit
   echo -e "${PROGNAME}: ${1:-"Unknown Error"}" >&2
+  if [[ ${_USE_DEBUG} -eq 1 ]]; then
+    traceback
+  fi
   clean_up
   exit 1
 }
@@ -1120,6 +1239,7 @@ error_exit() { # give error message on error exit
 find_dns_utils() {
     HAS_NSLOOKUP=false
     HAS_DIG_OR_DRILL=""
+    DIG_SUPPORTS_NOIDNOUT=false
     HAS_HOST=false
     if [[ -n "$(command -v nslookup 2>/dev/null)" ]]; then
         debug "HAS NSLOOKUP=true"
@@ -1127,16 +1247,23 @@ find_dns_utils() {
     fi
 
     if [[ -n "$(command -v drill 2>/dev/null)" ]]; then
-        debug "HAS DIG_OR_DRILL=drill"
         HAS_DIG_OR_DRILL="drill"
     elif [[ -n "$(command -v dig 2>/dev/null)" ]] && dig >/dev/null 2>&1; then
-        if [[ $(dig -r >/dev/null 2>&1) ]]; then
+        if dig -r >/dev/null 2>&1; then
           # use dig -r so ~/.digrc is not used
           HAS_DIG_OR_DRILL="dig -r"
         else
           HAS_DIG_OR_DRILL="dig"
         fi
+    fi
+
+    if [[ -n "$HAS_DIG_OR_DRILL" ]]; then
+        if $HAS_DIG_OR_DRILL +noidnout >/dev/null 2>&1; then
+          DIG_SUPPORTS_NOIDNOUT=true
+        fi
+
         debug "HAS DIG_OR_DRILL=$HAS_DIG_OR_DRILL"
+        debug "DIG_SUPPORTS_NOIDNOUT=$DIG_SUPPORTS_NOIDNOUT"
     fi
 
     if [[ -n "$(command -v host 2>/dev/null)" ]]; then
@@ -1316,7 +1443,11 @@ for d in "${alldomains[@]}"; do
       else
         sleep "$HTTP_TOKEN_CHECK_WAIT"
         # check that we can reach the challenge ourselves, if not, then error
-        if [[ ! "$(curl --user-agent "$CURL_USERAGENT" -k --silent --location "$wellknown_url")" == "$keyauthorization" ]]; then
+        # ACME only allows port 80 (http), but redirects may use https.  --insecure is used in case
+        # those certificates are being renewed.  Let's Encrypt does the same.  In this case, we verify
+        # that the correct data is returned, so this is safe.
+        # shellcheck disable=SC2086
+        if [[ ! "$(curl ${_NOMETER} --user-agent "$CURL_USERAGENT" --insecure --silent --location "$wellknown_url")" == "$keyauthorization" ]]; then
           error_exit "for some reason could not reach $wellknown_url - please check it manually"
         fi
       fi
@@ -1329,10 +1460,10 @@ for d in "${alldomains[@]}"; do
         if [[ "${t_loc:0:4}" == "ssh:" ]] ; then
           sshhost=$(echo "${t_loc}"| awk -F: '{print $2}')
           command="rm -f ${t_loc:(( ${#sshhost} + 5))}/${token:?}"
-          debug "running following command to remove token"
-          debug "ssh $SSH_OPTS $sshhost ${command}"
+          debug "running following command to remove token:"
+          debug "ssh $SSH_OPTS $sshhost ${command} $_REDIRECT_OUTPUT"
           # shellcheck disable=SC2029 disable=SC2086
-          ssh $SSH_OPTS "$sshhost" "${command}" 1>/dev/null 2>&1
+          ssh $SSH_OPTS "$sshhost" "${command}" $_REDIRECT_OUTPUT
           rm -f "${TEMP_DIR:?}/${token:?}"
         elif [[ "${t_loc:0:4}" == "ftp:" ]] ; then
           debug "using ftp to remove token file"
@@ -1386,17 +1517,16 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
       gad_s="@$gad_s"
     fi
 
-    # Check if domain is a CNAME, first
-    test_output "Using $HAS_DIG_OR_DRILL CNAME"
-
     # Two options here; either dig CNAME will return the CNAME and the NS or just the CNAME
-    debug Checking for CNAME using "$HAS_DIG_OR_DRILL CNAME $gad_d $gad_s"
-    res=$($HAS_DIG_OR_DRILL CNAME "$gad_d" $gad_s| grep "^$gad_d")
+    debug "Using $HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS CNAME $gad_d $gad_s"
+    # shellcheck disable=SC2086
+    res=$($HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS CNAME "$gad_d" $gad_s| grep "^$gad_d")
     cname=$(echo "$res"| awk '$4 ~ "CNAME" {print $5}' |sed 's/\.$//g')
 
     if [[ $_TEST_SKIP_CNAME_CALL == 0 ]]; then
       debug Checking if CNAME result contains NS records
-      res=$($HAS_DIG_OR_DRILL CNAME "$gad_d" $gad_s| grep -E "IN\W(NS|SOA)\W")
+      # shellcheck disable=SC2086
+      res=$($HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS CNAME "$gad_d" $gad_s| grep -E "IN\W(NS|SOA)\W")
     else
       res=
     fi
@@ -1409,22 +1539,21 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
 
     # Use SOA +trace to find the name server
     if [[ -z "$res" ]] && [[ $_TEST_SKIP_SOA_CALL == 0 ]]; then
+      # shellcheck disable=SC2086
       if [[ "$HAS_DIG_OR_DRILL" == "drill" ]]; then
-        debug Using "$HAS_DIG_OR_DRILL -T $gad_d $gad_s" to find primary nameserver
-        test_output "Using $HAS_DIG_OR_DRILL SOA"
-        res=$($HAS_DIG_OR_DRILL -T SOA "$gad_d" $gad_s 2>/dev/null | grep "IN\WNS\W")
+        debug Using "$HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS -T SOA $gad_d $gad_s" to find primary nameserver
+        res=$($HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS -T SOA "$gad_d" $gad_s 2>/dev/null | grep "IN\WNS\W")
       else
-        debug Using "$HAS_DIG_OR_DRILL SOA +trace +nocomments $gad_d $gad_s" to find primary nameserver
-        test_output "Using $HAS_DIG_OR_DRILL SOA"
-        res=$($HAS_DIG_OR_DRILL SOA +trace +nocomments "$gad_d" $gad_s 2>/dev/null | grep "IN\WNS\W")
+        debug Using "$HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS SOA +trace +nocomments $gad_d $gad_s" to find primary nameserver
+        res=$($HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS SOA +trace +nocomments "$gad_d" $gad_s 2>/dev/null | grep "IN\WNS\W")
       fi
     fi
 
     # Query for NS records
     if [[ -z "$res" ]]; then
-      test_output "Using $HAS_DIG_OR_DRILL NS"
-      debug Using "$HAS_DIG_OR_DRILL NS $gad_d $gad_s" to find primary nameserver
-      res=$($HAS_DIG_OR_DRILL NS "$gad_d" $gad_s | grep -E "IN\W(NS|SOA)\W")
+      debug Using "$HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS NS $gad_d $gad_s" to find primary nameserver
+      # shellcheck disable=SC2086
+      res=$($HAS_DIG_OR_DRILL $DNS_CHECK_OPTIONS NS "$gad_d" $gad_s | grep -E "IN\W(NS|SOA)\W")
     fi
 
     if [[ -n "$res" ]]; then
@@ -1451,7 +1580,7 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
         primary_ns="$primary_ns $PUBLIC_DNS_SERVER"
       fi
 
-      test_output set primary_ns ="$primary_ns"
+      debug set primary_ns ="$primary_ns"
 
       return
     fi
@@ -1463,11 +1592,11 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
   if [[ "$HAS_HOST" == "true" ]]; then
     gad_d="$orig_gad_d"
     debug Using "host -t NS" to find primary name server for "$gad_d"
+    # shellcheck disable=SC2086
     if [[ -z "$gad_s" ]]; then
-      res=$(host -t NS "$gad_d"| grep "name server")
+      res=$(host $DNS_CHECK_OPTIONS -t NS "$gad_d"| grep "name server")
     else
-      # shellcheck disable=SC2086
-      res=$(host -t NS "$gad_d" $gad_s| grep "name server")
+      res=$(host $DNS_CHECK_OPTIONS -t NS "$gad_d" $gad_s| grep "name server")
     fi
     if [[ -n "$res" ]]; then
       all_auth_dns_servers=$(echo "$res" | awk '{print $4}' | sed 's/\.$//g'|tr '\n' ' ')
@@ -1487,9 +1616,9 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
 
   if [[ "$HAS_NSLOOKUP" == "true" ]]; then
     gad_d="$orig_gad_d"
-    debug Using "nslookup -debug -type=soa -type=ns $gad_d $gad_s" to find primary name server
+    debug Using "nslookup $DNS_CHECK_OPTIONS -debug -type=soa -type=ns $gad_d $gad_s" to find primary name server
     # shellcheck disable=SC2086
-    res=$(nslookup -debug -type=soa -type=ns "$gad_d" ${gad_s})
+    res=$(nslookup $DNS_CHECK_OPTIONS -debug -type=soa -type=ns "$gad_d" ${gad_s})
 
     if [[ "$(echo "$res" | grep -c "Non-authoritative")" -gt 0 ]]; then
       # this is a Non-authoritative server, need to check for an authoritative one.
@@ -1505,7 +1634,7 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
       fi
 
       # shellcheck disable=SC2086
-      res=$(nslookup -debug -type=soa -type=ns "$gad_d" ${gad_s})
+      res=$(nslookup $DNS_CHECK_OPTIONS -debug -type=soa -type=ns "$gad_d" ${gad_s})
     fi
 
     if [[ "$(echo "$res" | grep -c "canonical name")" -gt 0 ]]; then
@@ -1521,7 +1650,7 @@ get_auth_dns() { # get the authoritative dns server for a domain (sets primary_n
 
     # shellcheck disable=SC2086
     # not quoting gad_s fixes the nslookup: couldn't get address for '': not found warning (#332)
-    all_auth_dns_servers=$(nslookup -debug -type=soa -type=ns "$gad_d" $gad_s \
+    all_auth_dns_servers=$(nslookup $DNS_CHECK_OPTIONS -debug -type=soa -type=ns "$gad_d" $gad_s \
                           | awk '$1 ~ "nameserver" {print $3}' \
                           | sed 's/\.$//g'| tr '\n' ' ')
 
@@ -1549,13 +1678,15 @@ get_certificate() { # get certificate for csr, if all domains validated.
   gc_fullchain=$4   # The filename for the fullchain
 
   der=$(openssl req -in "$gc_csr" -outform DER | urlbase64)
+
   if [[ $API -eq 1 ]]; then
     send_signed_request "$URL_new_cert" "{\"resource\": \"new-cert\", \"csr\": \"$der\"}" "needbase64"
     # convert certificate information into correct format and save to file.
     CertData=$(awk ' $1 ~ "^Location" {print $2}' "$CURL_HEADER" |tr -d '\r')
     if [[ "$CertData" ]] ; then
       echo -----BEGIN CERTIFICATE----- > "$gc_certfile"
-      curl --user-agent "$CURL_USERAGENT" --silent "$CertData" | openssl base64 -e  >> "$gc_certfile"
+      # shellcheck disable=SC2086
+      curl ${_NOMETER} --user-agent "$CURL_USERAGENT" --silent "$CertData" | openssl base64 -e  >> "$gc_certfile"
       echo -----END CERTIFICATE-----  >> "$gc_certfile"
       info "Certificate saved in $CERT_FILE"
     fi
@@ -1575,7 +1706,8 @@ get_certificate() { # get certificate for csr, if all domains validated.
                 | sed 's/>//g')
     if [[ "$IssuerData" ]] ; then
       echo -----BEGIN CERTIFICATE----- > "$gc_cafile"
-      curl --user-agent "$CURL_USERAGENT" --silent "$IssuerData" | openssl base64 -e  >> "$gc_cafile"
+      # shellcheck disable=SC2086
+      curl ${_NOMETER} --user-agent "$CURL_USERAGENT" --silent "$IssuerData" | openssl base64 -e  >> "$gc_cafile"
       echo -----END CERTIFICATE-----  >> "$gc_cafile"
       info "The intermediate CA cert is in $gc_cafile"
     fi
@@ -1633,7 +1765,8 @@ get_certificate() { # get certificate for csr, if all domains validated.
       cp "$gc_certfile" "$gc_fullchain"
       while [[ -n "$issuer_url" ]]; do
         debug Fetching certificate issuer from "$issuer_url"
-        issuer_cert=$(curl --user-agent "$CURL_USERAGENT" --silent "$issuer_url" | openssl x509 -inform der -outform pem)
+        # shellcheck disable=SC2086
+        issuer_cert=$(curl ${_NOMETER} --user-agent "$CURL_USERAGENT" --silent "$issuer_url" | openssl x509 -inform der -outform pem)
         debug Fetched issuer certificate "$(echo "$issuer_cert" | openssl x509 -inform pem -noout -text | awk 'BEGIN {FS="Subject: "} NF==2 {print $2; exit}')"
         echo "$issuer_cert" >> "$gc_fullchain"
 
@@ -1648,7 +1781,8 @@ get_certificate() { # get certificate for csr, if all domains validated.
 get_cr() { # get curl response
   url="$1"
   debug url "$url"
-  response=$(curl --user-agent "$CURL_USERAGENT" --silent "$url")
+  # shellcheck disable=SC2086
+  response=$(curl ${_NOMETER} --user-agent "$CURL_USERAGENT" --silent "$url")
   ret=$?
   debug response "${response//[$'\t\r\n']}"
   code=$(json_get "$response" status)
@@ -1731,7 +1865,7 @@ get_signing_params() { # get signing parameters from key
 }
 
 graceful_exit() { # normal exit function.
-  exit_code=$1
+  exit_code="${1-0}"
   clean_up
   # shellcheck disable=SC2086
   exit $exit_code
@@ -1755,10 +1889,11 @@ help_message() { # print out the help message
 	  -Q, --mute         Like -q, but also mute notification about successful upgrade
 	  -r, --revoke   "cert" "key" [CA_server] Revoke a certificate (the cert and key are required)
 	  -u, --upgrade      Upgrade getssl if a more recent version is available - can be used with or without domain(s)
-	  -k, --keep     "#" Maximum number of old getssl versions to keep when upgrading
+	  -X, --experimental tag  Upgrade to experimental releases, specified by tag (e.g. v9.43)
 	  -U, --nocheck      Do not check if a more recent version is available
+	  -v  --version      Display current version of $PROGNAME
 	  -w working_dir "Working directory"
-    --preferred-chain "chain" Use an alternate chain for the certificate
+	  --preferred-chain "chain" Use an alternate chain for the certificate
 
 	_EOF_
 }
@@ -1770,12 +1905,12 @@ hex2bin() { # Remove spaces, add leading zero, escape as hex string ensuring no 
 
 info() { # write out info as long as the quiet flag has not been set.
   if [[ ${_QUIET} -eq 0 ]]; then
-    # If running tests then output in TAP format as well (for debugging tests)
-    if [[ ${_RUNNING_TEST} -eq 1 ]]; then
-      echo "# $(date "+%b %d %T") ${FUNCNAME[1]}:${BASH_LINENO[1]}" "$@" >&3
+    # If running tests then verbose output (for debugging tests)
+    if [[ -n ${BATS_RUN_TMPDIR} ]]; then
+      echo "$(date "+%b %d %T") ${FUNCNAME[1]}:${BASH_LINENO[1]}" "$@"
+    else
+      echo "$@"
     fi
-
-    echo "$@"
   fi
 }
 
@@ -1985,10 +2120,22 @@ json_get() { # get values from json
 
 obtain_ca_resource_locations()
 {
+  CURL_RESPONSE_FILE="$(mktemp 2>/dev/null || mktemp -t getssl.XXXXXX)"
+
   for suffix in "" "/directory" "/dir";
   do
     # Obtain CA resource locations
-    ca_all_loc=$(curl --user-agent "$CURL_USERAGENT" "${CA}${suffix}" 2>/dev/null)
+    # shellcheck disable=SC2086
+    ca_all_loc=$(curl ${_NOMETER} --user-agent "$CURL_USERAGENT" "${CA}${suffix}" 2> $CURL_RESPONSE_FILE)
+    errcode=$?
+    if [[ $errcode -ne 0 ]]; then
+      response=$(cat "$CURL_RESPONSE_FILE")
+      rm "$CURL_RESPONSE_FILE"
+      error_exit "ERROR curl \"$CA$suffix\" failed with $errcode and returned:\n$response"
+    else
+      rm "$CURL_RESPONSE_FILE"
+    fi
+
     debug "ca_all_loc from ${CA}${suffix} gives $ca_all_loc"
     # APIv1
     URL_new_reg=$(echo "$ca_all_loc" | grep "new-reg" | awk -F'"' '{print $4}')
@@ -2005,10 +2152,11 @@ obtain_ca_resource_locations()
     fi
   done
 
-  if [[ -n "$URL_new_reg" ]]; then
-    API=1
-  elif [[ -n "$URL_newAccount" ]]; then
+  # If a directory offers both versions, select V2.
+  if [[ -n "$URL_newAccount" ]]; then
     API=2
+  elif [[ -n "$URL_new_reg" ]]; then
+    API=1
   else
     error_exit "unknown API version"
   fi
@@ -2059,10 +2207,10 @@ reload_service() {  # Runs a command to reload services ( via ssh if needed)
         sshhost=$(echo "$ARELOAD_CMD"| awk -F: '{print $2}')
         command=${ARELOAD_CMD:(( ${#sshhost} + 5))}
         debug "running following command to reload cert:"
-        debug "ssh $SSH_OPTS $sshhost ${command}"
+        debug "ssh $SSH_OPTS $sshhost ${command} $_REDIRECT_OUTPUT"
         # shellcheck disable=SC2029
         # shellcheck disable=SC2086
-        ssh $SSH_OPTS "$sshhost" "${command}" 1>/dev/null 2>&1
+        ssh $SSH_OPTS "$sshhost" "${command}" $_REDIRECT_OUTPUT
         # allow 2 seconds for services to restart
         sleep 2
       else
@@ -2169,9 +2317,8 @@ send_signed_request() { # Sends a request to the ACME server, signed with your p
   CURL_HEADER="$TEMP_DIR/curl.header"
   dp="$TEMP_DIR/curl.dump"
 
-  CURL="curl "
-  # shellcheck disable=SC2072
-  if [[ "$($CURL -V | head -1 | cut -d' ' -f2 )" > "7.33" ]]; then
+  CURL="curl ${_NOMETER} "
+  if check_version "${_CURL_VERSION}" "7.33" ; then
     CURL="$CURL --http1.1 "
   fi
 
@@ -2247,7 +2394,7 @@ send_signed_request() { # Sends a request to the ACME server, signed with your p
       fi
 
       if [[ $errcode -gt 0 || ( "$response" == "" && $url != *"revoke"* ) ]]; then
-        error_exit "ERROR curl \"$url\" failed with $errcode and returned $response"
+        error_exit "ERROR curl \"$url\" failed with $errcode and returned \"$response\""
       fi
 
       responseHeaders=$(cat "$CURL_HEADER")
@@ -2346,6 +2493,17 @@ signal_exit() { # Handle trapped signals
   esac
 }
 
+traceback() { # Print function traceback
+  local i d=1 lbl=" called"
+  debug "Traceback"
+  for ((i=$((${#FUNCNAME[@]}-1)); i>0; i--)); do
+    if [[ ${i} -eq 1 ]] ; then lbl=" called traceback" ; fi
+    debug "$(printf "%*s%s() line %d%s\n" "$d" '' "${FUNCNAME[$i]}" "${BASH_LINENO[$((i-1))]}" "$lbl")"
+    ((d++))
+  done
+  return 0
+}
+
 urlbase64() { # urlbase64: base64 encoded string with '+' replaced with '-' and '/' replaced with '_'
   openssl base64 -e | tr -d '\n\r' | os_esed -e 's:=*$::g' -e 'y:+/:-_:'
 }
@@ -2364,7 +2522,7 @@ urlbase64_decode() {
 
 usage() { # echos out the program usage
   echo "Usage: $PROGNAME [-h|--help] [-d|--debug] [-c|--create] [-f|--force] [-a|--all] [-q|--quiet]"\
-       "[-Q|--mute] [-u|--upgrade] [-k|--keep #] [-U|--nocheck] [-r|--revoke cert key] [-w working_dir]"\
+       "[-Q|--mute] [-u|--upgrade] [-X|--experimental tag] [-U|--nocheck] [-r|--revoke cert key] [-w working_dir]"\
        "[--preferred-chain chain] domain"
 }
 
@@ -2401,17 +2559,20 @@ write_domain_template() { # write out a template file for a domain.
 		# An ssh key will be needed to provide you with access to the remote server.
 		# Optionally, you can specify a different userid for ssh/scp to use on the remote server before the @ sign.
 		# If left blank, the username on the local server will be used to authenticate against the remote server.
-		# If these start with ftp:/ftpes: then the next variables are ftpuserid:ftppassword:servername:ACL_location
+		# If these start with ftp:/ftpes:/ftps: then the next variables are ftpuserid:ftppassword:servername:ACL_location
 		# These should be of the form "/path/to/your/website/folder/.well-known/acme-challenge"
 		# where "/path/to/your/website/folder/" is the path, on your web server, to the web root for your domain.
+		# ftp: uses regular ftp; ftpes: ftp over explicit TLS (port 21); ftps: ftp over implicit TLS (port 990).
+		# ftps/ftpes support FTPS_OPTIONS, e.g. to add "--insecure" to the curl command for hosts with self-signed certificates.
 		# You can also user WebDAV over HTTPS as transport mechanism. To do so, start with davs: followed by username,
 		# password, host, port (explicitly needed even if using default port 443) and path on the server.
-        # Multiple locations can be defined for a file by separating the locations with a semi-colon.
+		# Multiple locations can be defined for a file by separating the locations with a semi-colon.
 		#ACL=('/var/www/${DOMAIN}/web/.well-known/acme-challenge'
 		#     'ssh:server5:/var/www/${DOMAIN}/web/.well-known/acme-challenge'
 		#     'ssh:sshuserid@server5:/var/www/${DOMAIN}/web/.well-known/acme-challenge'
 		#     'ftp:ftpuserid:ftppassword:${DOMAIN}:/web/.well-known/acme-challenge'
 		#     'davs:davsuserid:davspassword:{DOMAIN}:443:/web/.well-known/acme-challenge'
+		#     'ftps:ftpuserid:ftppassword:${DOMAIN}:/web/.well-known/acme-challenge'
 		#     'ftpes:ftpuserid:ftppassword:${DOMAIN}:/web/.well-known/acme-challenge')
 
 		# Specify SSH options, e.g. non standard port in SSH_OPTS
@@ -2515,6 +2676,19 @@ write_getssl_template() { # write out the main template file
 	#VALIDATE_VIA_DNS="true"
 	#DNS_ADD_COMMAND=
 	#DNS_DEL_COMMAND=
+
+	# Unusual configurations (especially split views) may require these.
+	# If you have a mixture, these can go in the per-domain getssl.cfg.
+	#
+	# If you must use an external DNS Server (e.g. due to split views)
+	# Specify it here.  Otherwise, the default is to find the zone master.
+	# The default will usually work.
+	# PUBLIC_DNS_SERVER="8.8.8.8"
+
+	# If getssl is unable to determine the authoritative nameserver for a domain
+	# it will as you to enter AUTH_DNS_SERVER.  This is a server that
+	# can answer queries for the zone - a master or a slave, not a recursive server.
+	# AUTH_DNS_SERVER="10.0.0.14"
 	_EOF_getssl_
 }
 
@@ -2537,6 +2711,8 @@ while [[ -n ${1+defined} ]]; do
   case $1 in
     -h | --help)
       help_message; graceful_exit ;;
+    -v | --version)
+      echo "$PROGNAME V$VERSION"; graceful_exit ;;
     -d | --debug)
       _USE_DEBUG=1 ;;
     -c | --create)
@@ -2549,7 +2725,8 @@ while [[ -n ${1+defined} ]]; do
     -a | --all)
       _CHECK_ALL=1 ;;
     -k | --keep)
-      shift; _KEEP_VERSIONS="$1";;
+      shift;
+      echo "--keep has no effect" ;;
     -q | --quiet)
       _QUIET=1 ;;
     -Q | --mute)
@@ -2567,6 +2744,9 @@ while [[ -n ${1+defined} ]]; do
       REVOKE_REASON=0 ;;
     -u | --upgrade)
       _UPGRADE=1 ;;
+    -X | --experimental)
+      _UPGRADE_TO_TAG="$1"
+      shift ;;
     -U | --nocheck)
       _UPGRADE_CHECK=0 ;;
     -i | --install)
@@ -2594,6 +2774,11 @@ while [[ -n ${1+defined} ]]; do
   shift
 done
 
+if [[ ${_USE_DEBUG} -eq 1 ]]; then
+  # Do not hide outputs when debug mode is on
+  _REDIRECT_OUTPUT=""
+fi
+
 # Main logic
 ############
 
@@ -2619,6 +2804,25 @@ requires grep
 requires sed
 requires sort
 requires mktemp
+
+# Make sure cURL doesn't display a progress meter (if it's new enough)
+# --silent also does this, but suppresses warnings and informational messages too.
+# TODO: see where --silent can be removed (if _NOMETER defaults to --silent for old versions?)
+#       This would help with debugging transfer errors.
+
+_CURL_VERSION="$(curl -V | head -1 | cut -d' ' -f2 )"
+if check_version "${_CURL_VERSION}" "7.67" ; then
+    _NOMETER="--no-progress-meter"
+fi
+
+# Make sure mktemp works before going too far
+MKDIR_TEST_FILE="$(mktemp 2>/dev/null || mktemp -t getssl.XXXXXX)"
+if [ "$MKDIR_TEST_FILE" == "" ]; then
+  error_exit "mktemp failed"
+else
+  rm "$MKDIR_TEST_FILE"
+fi
+unset MKDIR_TEST_FILE
 
 # Check if upgrades are available (unless they have specified -U to ignore Upgrade checks)
 if [[ $_UPGRADE_CHECK -eq 1 ]]; then
@@ -2679,6 +2883,12 @@ if [[ -s "$WORKING_DIR/getssl.cfg" ]]; then
   debug "reading config from $WORKING_DIR/getssl.cfg"
   # shellcheck source=/dev/null
   . "$WORKING_DIR/getssl.cfg"
+fi
+
+if [[ -n "$DNS_CHECK_FUNC" ]]; then
+  requires "${DNS_CHECK_FUNC}"
+else
+  requires nslookup drill dig host DNS_CHECK_FUNC
 fi
 
 # Define defaults for variables not set in the main config.
@@ -2771,6 +2981,7 @@ if [[ ${_CREATE_CONFIG} -eq 1 ]]; then
       info "Adding SANS=$EX_SANS from certificate installed on ${DOMAIN##\*.} to new configuration file"
     fi
     write_domain_template "$DOMAIN_DIR/getssl.cfg"
+    info "created domain config file in $DOMAIN_DIR/getssl.cfg"
   fi
   TEMP_DIR="$DOMAIN_DIR/tmp"
   # end of "-c|--create" option, so exit
@@ -2910,11 +3121,15 @@ if [[ "${CHECK_REMOTE}" == "true" ]] && [[ $_FORCE_RENEW -eq 0 ]]; then
           copy_file_to_location "full pem" \
                                 "$TEMP_DIR/${DOMAIN}_chain.pem" \
                                 "$DOMAIN_CHAIN_LOCATION"
+          umask 077
           cat "$DOMAIN_DIR/${DOMAIN}.key" "$CERT_FILE" > "$TEMP_DIR/${DOMAIN}_K_C.pem"
+          umask "$ORIG_UMASK"
           copy_file_to_location "private key and domain cert pem" \
                                 "$TEMP_DIR/${DOMAIN}_K_C.pem"  \
                                 "$DOMAIN_KEY_CERT_LOCATION"
+          umask 077
           cat "$DOMAIN_DIR/${DOMAIN}.key" "$CERT_FILE" "$CA_CERT" > "$TEMP_DIR/${DOMAIN}.pem"
+          umask "$ORIG_UMASK"
           copy_file_to_location "full pem" \
                                 "$TEMP_DIR/${DOMAIN}.pem"  \
                                 "$DOMAIN_PEM_LOCATION"
@@ -2935,14 +3150,43 @@ if [[ "${CHECK_REMOTE}" == "true" ]] && [[ $_FORCE_RENEW -eq 0 ]]; then
 fi
 # end of .... check_remote is true then connect and obtain the current certificate
 
+#create SAN
+if [[ -z "$SANS" ]]; then
+  SANLIST="subjectAltName=DNS:${DOMAIN}"
+elif [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
+  SANLIST="subjectAltName=DNS:${SANS//[, ]/,DNS:}"
+else
+  SANLIST="subjectAltName=DNS:${DOMAIN},DNS:${SANS//[, ]/,DNS:}"
+fi
+debug "created SAN list = $SANLIST"
+
+# check if private key alg has changed from RSA to EC (or vice versa)
+if [[ "$DUAL_RSA_ECDSA" == "false" ]] && [[ -s "$DOMAIN_DIR/${DOMAIN}.key" ]]; then
+  case "${PRIVATE_KEY_ALG}" in
+    rsa)
+      if grep -q -- "-----BEGIN EC PRIVATE KEY-----" "$DOMAIN_DIR/${DOMAIN}.key"; then
+        rm -f "$DOMAIN_DIR/${DOMAIN}.key"
+        _FORCE_RENEW=1
+      fi ;;
+    prime256v1|secp384r1|secp521r1)
+      if grep -q -- "-----BEGIN RSA PRIVATE KEY-----" "$DOMAIN_DIR/${DOMAIN}.key"; then
+        rm -f "$DOMAIN_DIR/${DOMAIN}.key"
+        _FORCE_RENEW=1
+      fi ;;
+  esac
+fi
+
 # if there is an existing certificate file, check details.
 if [[ -s "$CERT_FILE" ]]; then
   debug "certificate $CERT_FILE exists"
   enddate=$(openssl x509 -in "$CERT_FILE" -noout -enddate 2>/dev/null| cut -d= -f 2-)
   debug "local cert is valid until $enddate"
+  existing_sanlist=$(openssl x509 -in "$CERT_FILE" -noout -text | grep "DNS:" | sed '{ s/ *DNS://g; y/,/\n/; }' | sort -u | xargs | sed 's/ /,/g')
+  sorted_sanlist=$(echo "$SANLIST" | sed '{ s/subjectAltName=//; s/ *DNS://g; y/,/\n/; }' | sort -u | xargs | sed 's/ /,/g')
+  debug "local cert is for domains: ${existing_sanlist}"
   if [[ "$enddate" != "-" ]]; then
     enddate_s=$(date_epoc "$enddate")
-    if [[ $(date_renew) -lt "$enddate_s" ]] && [[ $_FORCE_RENEW -ne 1 ]]; then
+    if [[ $(date_renew) -lt "$enddate_s" ]] && [[ $_FORCE_RENEW -ne 1 ]] && [[ "$existing_sanlist" == "$sorted_sanlist" ]]; then
       issuer=$(openssl x509 -in "$CERT_FILE" -noout -issuer 2>/dev/null)
       if [[ "$issuer" == *"Fake LE Intermediate"* ]] && [[ "$CA" == "https://acme-v02.api.letsencrypt.org" ]]; then
         debug "upgrading from fake cert to real"
@@ -2952,6 +3196,9 @@ if [[ -s "$CERT_FILE" ]]; then
         graceful_exit $_NOTIFY_VALID
       fi
     else
+      if [[ "$existing_sanlist" != "$sorted_sanlist" ]]; then
+        info "Domain list in existing certificate ($existing_sanlist) does not match domains requested ($sorted_sanlist), so recreating certificate"
+      fi
       debug "${DOMAIN}: certificate needs renewal"
     fi
   fi
@@ -2981,6 +3228,7 @@ if [[ "$REUSE_PRIVATE_KEY" != "true" ]]; then
     rm -f "$DOMAIN_DIR/${DOMAIN}.ec.key"
   fi
 fi
+
 # create new domain keys if they don't already exist
 if [[ "$DUAL_RSA_ECDSA" == "false" ]]; then
   create_key "${PRIVATE_KEY_ALG}" "$DOMAIN_DIR/${DOMAIN}.key" "$DOMAIN_KEY_LENGTH"
@@ -2989,16 +3237,6 @@ else
   create_key "${PRIVATE_KEY_ALG}" "$DOMAIN_DIR/${DOMAIN}.ec.key" "$DOMAIN_KEY_LENGTH"
 fi
 # End of creating domain keys.
-
-#create SAN
-if [[ -z "$SANS" ]]; then
-  SANLIST="subjectAltName=DNS:${DOMAIN}"
-elif [[ "$IGNORE_DIRECTORY_DOMAIN" == "true" ]]; then
-  SANLIST="subjectAltName=DNS:${SANS//[, ]/,DNS:}"
-else
-  SANLIST="subjectAltName=DNS:${DOMAIN},DNS:${SANS//[, ]/,DNS:}"
-fi
-debug "created SAN list = $SANLIST"
 
 #create CSR's
 if [[ "$DUAL_RSA_ECDSA" == "false" ]]; then
