@@ -1,6 +1,6 @@
 {
     "name": "davidc/getssl",
-    "version": "1.0.0",
+    "version": "1.0.1-unreleased",
     "author": "Daniel Thielking, David Croft",
     "summary": "Automates Let's Encrypt certificates using the getssl script",
     "license": "Apache-2.0",
